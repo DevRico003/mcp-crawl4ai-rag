@@ -57,7 +57,6 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     browser_config = BrowserConfig(
         headless=True,
         verbose=False,
-        timeout=60000,  # 60 seconds timeout for browser operations
         args=["--disable-dev-shm-usage", "--disable-gpu", "--no-sandbox", "--disable-extensions"]  # More stable browser args
     )
     
@@ -247,7 +246,6 @@ async def browser_health_check_loop(context: Crawl4AIContext):
                         browser_config = BrowserConfig(
                             headless=True,
                             verbose=False,
-                            timeout=60000,
                             args=["--disable-dev-shm-usage", "--disable-gpu", "--no-sandbox", "--disable-extensions"]
                         )
                         
@@ -364,9 +362,7 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             # Configure the crawl with explicit timeouts
             run_config = CrawlerRunConfig(
                 cache_mode=CacheMode.BYPASS, 
-                stream=False,
-                page_timeout=45000,  # 45 seconds timeout for page operations
-                navigation_timeout=45000  # 45 seconds timeout for navigation
+                stream=False
             )
             
             # Crawl the page
@@ -673,11 +669,8 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[s
     Returns:
         List of dictionaries with URL and markdown content
     """
-    # Use a more robust configuration with explicit timeouts
-    crawl_config = CrawlerRunConfig(
-        page_timeout=45000,  # 45 seconds timeout
-        navigation_timeout=45000
-    )
+    # Use a more robust configuration
+    crawl_config = CrawlerRunConfig()
 
     try:
         result = await crawler.arun(url=url, config=crawl_config)
@@ -705,9 +698,7 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
     # Use more conservative settings for the crawler config
     crawl_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS, 
-        stream=False,
-        page_timeout=45000,  # 45 seconds timeout for page operations
-        navigation_timeout=45000  # 45 seconds timeout for navigation
+        stream=False
     )
     
     # Use more conservative memory management settings
@@ -740,12 +731,10 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     Returns:
         List of dictionaries with URL and markdown content
     """
-    # Use more conservative settings for the crawler config
+    # Use conservative settings for the crawler config
     run_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS, 
-        stream=False,
-        page_timeout=45000,  # 45 seconds timeout for page operations
-        navigation_timeout=45000  # 45 seconds timeout for navigation
+        stream=False
     )
     
     # Use more conservative memory management settings
