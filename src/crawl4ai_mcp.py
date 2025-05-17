@@ -53,11 +53,10 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     Yields:
         Crawl4AIContext: The context containing the Crawl4AI crawler and Supabase client
     """
-    # Create browser configuration with more conservative settings
+    # Create browser configuration with minimal settings
     browser_config = BrowserConfig(
         headless=True,
-        verbose=False,
-        args=["--disable-dev-shm-usage", "--disable-gpu", "--no-sandbox", "--disable-extensions"]  # More stable browser args
+        verbose=False
     )
     
     crawler = None
@@ -245,8 +244,7 @@ async def browser_health_check_loop(context: Crawl4AIContext):
                     try:
                         browser_config = BrowserConfig(
                             headless=True,
-                            verbose=False,
-                            args=["--disable-dev-shm-usage", "--disable-gpu", "--no-sandbox", "--disable-extensions"]
+                            verbose=False
                         )
                         
                         new_crawler = AsyncWebCrawler(config=browser_config)
