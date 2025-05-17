@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, urldefrag
 from xml.etree import ElementTree
+from playwright.async_api import Error as PlaywrightError
 from dotenv import load_dotenv
 from supabase import Client
 from pathlib import Path
@@ -19,6 +20,8 @@ import asyncio
 import json
 import os
 import re
+import time
+from functools import wraps
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 from utils import get_supabase_client, add_documents_to_supabase, search_documents
@@ -36,6 +39,8 @@ class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
     crawler: AsyncWebCrawler
     supabase_client: Client
+    last_health_check: float = 0.0
+    health_check_interval: float = 300.0  # Check browser health every 5 minutes
     
 @asynccontextmanager
 async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
@@ -48,27 +53,52 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     Yields:
         Crawl4AIContext: The context containing the Crawl4AI crawler and Supabase client
     """
-    # Create browser configuration
+    # Create browser configuration with more conservative settings
     browser_config = BrowserConfig(
         headless=True,
-        verbose=False
+        verbose=False,
+        timeout=60000,  # 60 seconds timeout for browser operations
+        args=["--disable-dev-shm-usage", "--disable-gpu", "--no-sandbox", "--disable-extensions"]  # More stable browser args
     )
     
-    # Initialize the crawler
-    crawler = AsyncWebCrawler(config=browser_config)
-    await crawler.__aenter__()
-    
-    # Initialize Supabase client
-    supabase_client = get_supabase_client()
+    crawler = None
+    supabase_client = None
     
     try:
-        yield Crawl4AIContext(
+        # Initialize the crawler
+        crawler = AsyncWebCrawler(config=browser_config)
+        await crawler.__aenter__()
+        
+        # Initialize Supabase client
+        supabase_client = get_supabase_client()
+        
+        # Create context with current time as last health check
+        context = Crawl4AIContext(
             crawler=crawler,
-            supabase_client=supabase_client
+            supabase_client=supabase_client,
+            last_health_check=time.time()
         )
+        
+        # Start background health check task
+        asyncio.create_task(browser_health_check_loop(context))
+        
+        # Return the context
+        yield context
+    except Exception as e:
+        print(f"Error during crawler initialization: {str(e)}")
+        if crawler:
+            try:
+                await crawler.__aexit__(None, None, None)
+            except Exception as cleanup_error:
+                print(f"Error during crawler cleanup: {str(cleanup_error)}")
+        raise
     finally:
         # Clean up the crawler
-        await crawler.__aexit__(None, None, None)
+        if crawler:
+            try:
+                await crawler.__aexit__(None, None, None)
+            except Exception as e:
+                print(f"Error during crawler cleanup: {str(e)}")
 
 # Initialize FastMCP server
 mcp = FastMCP(
@@ -103,6 +133,51 @@ def is_txt(url: str) -> bool:
     """
     return url.endswith('.txt')
 
+
+async def retry_async(max_retries=3, initial_delay=1, backoff_factor=2, exception_types=(Exception,)):
+    """
+    A decorator for retrying asynchronous functions with exponential backoff.
+    
+    Args:
+        max_retries: Maximum number of retries before giving up
+        initial_delay: Initial delay between retries in seconds
+        backoff_factor: Factor by which the delay increases each retry
+        exception_types: Tuple of exception types to catch and retry
+        
+    Returns:
+        Decorator function
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+            
+            for attempt in range(max_retries + 1):  # +1 for the initial attempt
+                try:
+                    return await func(*args, **kwargs)
+                except exception_types as e:
+                    last_exception = e
+                    # Don't sleep if this was the last attempt
+                    if attempt < max_retries:
+                        # Check if it's a Playwright 'target closed' error
+                        is_target_closed = isinstance(e, PlaywrightError) and "Target page, context or browser has been closed" in str(e)
+                        
+                        # Log the retry attempt
+                        error_type = "browser disconnect" if is_target_closed else type(e).__name__
+                        print(f"Retry {attempt+1}/{max_retries} after {error_type} error: {str(e)}")
+                        
+                        # Sleep with exponential backoff
+                        await asyncio.sleep(delay)
+                        delay *= backoff_factor
+            
+            # If we get here, all retries failed
+            print(f"All {max_retries} retries failed. Last error: {str(last_exception)}")
+            raise last_exception
+        
+        return wrapper
+    return decorator
+
 def parse_sitemap(sitemap_url: str) -> List[str]:
     """
     Parse a sitemap and extract URLs.
@@ -124,6 +199,77 @@ def parse_sitemap(sitemap_url: str) -> List[str]:
             print(f"Error parsing sitemap XML: {e}")
 
     return urls
+
+async def browser_health_check_loop(context: Crawl4AIContext):
+    """
+    Background task that periodically checks browser health.
+    If the browser is disconnected, it will attempt to recreate it.
+    
+    Args:
+        context: The Crawl4AI context with crawler instance
+    """
+    while True:
+        try:
+            # Wait for the health check interval
+            await asyncio.sleep(context.health_check_interval)
+            
+            # Check if it's time for a health check
+            current_time = time.time()
+            if current_time - context.last_health_check >= context.health_check_interval:
+                print("Performing browser health check...")
+                
+                # Test the browser connection with a simple operation
+                try:
+                    # Attempt to create a new page to verify browser is still working
+                    browser = context.crawler.browser
+                    if browser:
+                        page = await browser.new_page()
+                        await page.goto("about:blank", timeout=10000)
+                        await page.close()
+                        print("Browser health check successful")
+                    else:
+                        print("Browser reference is None, attempting to recreate crawler")
+                        raise Exception("Browser reference is None")
+                    
+                except Exception as e:
+                    print(f"Browser health check failed: {str(e)}")
+                    print("Attempting to recreate browser...")
+                    
+                    # Try to close the existing browser
+                    try:
+                        if context.crawler:
+                            await context.crawler.__aexit__(None, None, None)
+                    except Exception as close_error:
+                        print(f"Error closing existing browser: {str(close_error)}")
+                    
+                    # Create a new browser
+                    try:
+                        browser_config = BrowserConfig(
+                            headless=True,
+                            verbose=False,
+                            timeout=60000,
+                            args=["--disable-dev-shm-usage", "--disable-gpu", "--no-sandbox", "--disable-extensions"]
+                        )
+                        
+                        new_crawler = AsyncWebCrawler(config=browser_config)
+                        await new_crawler.__aenter__()
+                        
+                        # Replace the crawler in the context
+                        context.crawler = new_crawler
+                        print("Browser successfully recreated")
+                    except Exception as recreate_error:
+                        print(f"Failed to recreate browser: {str(recreate_error)}")
+                
+                # Update the last health check time
+                context.last_health_check = current_time
+        
+        except asyncio.CancelledError:
+            print("Browser health check task cancelled")
+            break
+        except Exception as e:
+            print(f"Error in browser health check loop: {str(e)}")
+            # Wait a bit before trying again
+            await asyncio.sleep(60)
 
 def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
     """Split text into chunks, respecting code blocks and paragraphs."""
@@ -204,71 +350,135 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
     Returns:
         Summary of the crawling operation and storage in Supabase
     """
-    try:
-        # Get the crawler from the context
-        crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
-        
-        # Configure the crawl
-        run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
-        
-        # Crawl the page
-        result = await crawler.arun(url=url, config=run_config)
-        
-        if result.success and result.markdown:
-            # Chunk the content
-            chunks = smart_chunk_markdown(result.markdown)
+    # Track retry attempts
+    max_retries = 3
+    retry_count = 0
+    last_error = None
+    
+    while retry_count <= max_retries:
+        try:
+            # Get the crawler from the context
+            crawler = ctx.request_context.lifespan_context.crawler
+            supabase_client = ctx.request_context.lifespan_context.supabase_client
             
-            # Prepare data for Supabase
-            urls = []
-            chunk_numbers = []
-            contents = []
-            metadatas = []
+            # Configure the crawl with explicit timeouts
+            run_config = CrawlerRunConfig(
+                cache_mode=CacheMode.BYPASS, 
+                stream=False,
+                page_timeout=45000,  # 45 seconds timeout for page operations
+                navigation_timeout=45000  # 45 seconds timeout for navigation
+            )
             
-            for i, chunk in enumerate(chunks):
-                urls.append(url)
-                chunk_numbers.append(i)
-                contents.append(chunk)
+            # Crawl the page
+            result = await crawler.arun(url=url, config=run_config)
+            
+            if result.success and result.markdown:
+                # Chunk the content
+                chunks = smart_chunk_markdown(result.markdown)
                 
-                # Extract metadata
-                meta = extract_section_info(chunk)
-                meta["chunk_index"] = i
-                meta["url"] = url
-                meta["source"] = urlparse(url).netloc
-                meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
-                metadatas.append(meta)
+                # Prepare data for Supabase
+                urls = []
+                chunk_numbers = []
+                contents = []
+                metadatas = []
+                
+                for i, chunk in enumerate(chunks):
+                    urls.append(url)
+                    chunk_numbers.append(i)
+                    contents.append(chunk)
+                    
+                    # Extract metadata
+                    meta = extract_section_info(chunk)
+                    meta["chunk_index"] = i
+                    meta["url"] = url
+                    meta["source"] = urlparse(url).netloc
+                    meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                    metadatas.append(meta)
+                
+                # Create url_to_full_document mapping
+                url_to_full_document = {url: result.markdown}
+                
+                # Add to Supabase
+                try:
+                    # Use a smaller batch size for more reliable processing
+                    add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=10)
+                    
+                    return json.dumps({
+                        "success": True,
+                        "url": url,
+                        "chunks_stored": len(chunks),
+                        "content_length": len(result.markdown),
+                        "links_count": {
+                            "internal": len(result.links.get("internal", [])),
+                            "external": len(result.links.get("external", []))
+                        },
+                        "retry_count": retry_count
+                    }, indent=2)
+                except Exception as supabase_error:
+                    return json.dumps({
+                        "success": False,
+                        "url": url,
+                        "error": f"Database error: {str(supabase_error)}"
+                    }, indent=2)
+            else:
+                # Check if we should retry
+                retry_count += 1
+                last_error = result.error_message
+                
+                if retry_count <= max_retries:
+                    print(f"Retry {retry_count}/{max_retries} for URL {url} due to crawl failure: {last_error}")
+                    await asyncio.sleep(2 * retry_count)  # Exponential backoff
+                    continue
+                else:
+                    return json.dumps({
+                        "success": False,
+                        "url": url,
+                        "error": last_error,
+                        "retries_exhausted": True
+                    }, indent=2)
+        except PlaywrightError as e:
+            # Specifically handle Playwright errors
+            retry_count += 1
+            last_error = str(e)
             
-            # Create url_to_full_document mapping
-            url_to_full_document = {url: result.markdown}
+            if "Target page, context or browser has been closed" in last_error and retry_count <= max_retries:
+                print(f"Retry {retry_count}/{max_retries} for URL {url} after browser disconnect: {last_error}")
+                await asyncio.sleep(2 * retry_count)  # Exponential backoff
+                continue
+            elif retry_count <= max_retries:
+                print(f"Retry {retry_count}/{max_retries} for URL {url} after Playwright error: {last_error}")
+                await asyncio.sleep(2 * retry_count)  # Exponential backoff
+                continue
+            else:
+                return json.dumps({
+                    "success": False,
+                    "url": url,
+                    "error": f"Playwright error after {max_retries} retries: {last_error}"
+                }, indent=2)
+        except Exception as e:
+            retry_count += 1
+            last_error = str(e)
             
-            # Add to Supabase
-            add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
-            
-            return json.dumps({
-                "success": True,
-                "url": url,
-                "chunks_stored": len(chunks),
-                "content_length": len(result.markdown),
-                "links_count": {
-                    "internal": len(result.links.get("internal", [])),
-                    "external": len(result.links.get("external", []))
-                }
-            }, indent=2)
-        else:
-            return json.dumps({
-                "success": False,
-                "url": url,
-                "error": result.error_message
-            }, indent=2)
-    except Exception as e:
-        return json.dumps({
-            "success": False,
-            "url": url,
-            "error": str(e)
-        }, indent=2)
+            if retry_count <= max_retries:
+                print(f"Retry {retry_count}/{max_retries} for URL {url} after error: {last_error}")
+                await asyncio.sleep(2 * retry_count)  # Exponential backoff
+                continue
+            else:
+                return json.dumps({
+                    "success": False,
+                    "url": url,
+                    "error": f"Error after {max_retries} retries: {last_error}"
+                }, indent=2)
+    
+    # This should not be reached, but just in case
+    return json.dumps({
+        "success": False,
+        "url": url,
+        "error": f"Unknown error after {max_retries} retries"
+    }, indent=2)
 
 @mcp.tool()
-async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000) -> str:
+async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 5, chunk_size: int = 5000) -> str:
     """
     Intelligently crawl a URL based on its type and store content in Supabase.
     
@@ -283,104 +493,178 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         ctx: The MCP server provided context
         url: URL to crawl (can be a regular webpage, sitemap.xml, or .txt file)
         max_depth: Maximum recursion depth for regular URLs (default: 3)
-        max_concurrent: Maximum number of concurrent browser sessions (default: 10)
-        chunk_size: Maximum size of each content chunk in characters (default: 1000)
+        max_concurrent: Maximum number of concurrent browser sessions (default reduced to 5)
+        chunk_size: Maximum size of each content chunk in characters (default: 5000)
     
     Returns:
         JSON string with crawl summary and storage information
     """
-    try:
-        # Get the crawler and Supabase client from the context
-        crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
-        
-        crawl_results = []
-        crawl_type = "webpage"
-        
-        # Detect URL type and use appropriate crawl method
-        if is_txt(url):
-            # For text files, use simple crawl
-            crawl_results = await crawl_markdown_file(crawler, url)
-            crawl_type = "text_file"
-        elif is_sitemap(url):
-            # For sitemaps, extract URLs and crawl in parallel
-            sitemap_urls = parse_sitemap(url)
-            if not sitemap_urls:
+    # Track retry attempts
+    max_retries = 2  # For the overall operation
+    retry_count = 0
+    last_error = None
+    
+    while retry_count <= max_retries:
+        try:
+            # Get the crawler and Supabase client from the context
+            crawler = ctx.request_context.lifespan_context.crawler
+            supabase_client = ctx.request_context.lifespan_context.supabase_client
+            
+            crawl_results = []
+            crawl_type = "webpage"
+            
+            # Detect URL type and use appropriate crawl method
+            if is_txt(url):
+                # For text files, use simple crawl
+                crawl_results = await crawl_markdown_file(crawler, url)
+                crawl_type = "text_file"
+            elif is_sitemap(url):
+                # For sitemaps, extract URLs and crawl in parallel
+                try:
+                    sitemap_urls = parse_sitemap(url)
+                    if not sitemap_urls:
+                        return json.dumps({
+                            "success": False,
+                            "url": url,
+                            "error": "No URLs found in sitemap"
+                        }, indent=2)
+                    
+                    # Limit the number of URLs to crawl to prevent resource exhaustion
+                    max_urls_to_crawl = 100  # Reasonable limit to prevent overwhelming the system
+                    if len(sitemap_urls) > max_urls_to_crawl:
+                        print(f"Limiting sitemap crawl from {len(sitemap_urls)} to {max_urls_to_crawl} URLs")
+                        sitemap_urls = sitemap_urls[:max_urls_to_crawl]
+                    
+                    crawl_results = await crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
+                    crawl_type = "sitemap"
+                except Exception as sitemap_error:
+                    print(f"Error processing sitemap: {str(sitemap_error)}")
+                    if retry_count < max_retries:
+                        retry_count += 1
+                        await asyncio.sleep(2 * retry_count)  # Exponential backoff
+                        continue
+                    else:
+                        return json.dumps({
+                            "success": False,
+                            "url": url,
+                            "error": f"Sitemap processing error: {str(sitemap_error)}"
+                        }, indent=2)
+            else:
+                # For regular URLs, use recursive crawl
+                crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent)
+                crawl_type = "webpage"
+            
+            if not crawl_results:
+                # Try again if we didn't get any results
+                if retry_count < max_retries:
+                    retry_count += 1
+                    print(f"Retry {retry_count}/{max_retries} for URL {url} - no content found")
+                    await asyncio.sleep(2 * retry_count)  # Exponential backoff
+                    continue
+                else:
+                    return json.dumps({
+                        "success": False,
+                        "url": url,
+                        "error": "No content found after multiple attempts"
+                    }, indent=2)
+            
+            # Process results and store in Supabase
+            urls = []
+            chunk_numbers = []
+            contents = []
+            metadatas = []
+            chunk_count = 0
+            
+            for doc in crawl_results:
+                source_url = doc['url']
+                md = doc['markdown']
+                chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
+                
+                for i, chunk in enumerate(chunks):
+                    urls.append(source_url)
+                    chunk_numbers.append(i)
+                    contents.append(chunk)
+                    
+                    # Extract metadata
+                    meta = extract_section_info(chunk)
+                    meta["chunk_index"] = i
+                    meta["url"] = source_url
+                    meta["source"] = urlparse(source_url).netloc
+                    meta["crawl_type"] = crawl_type
+                    meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                    metadatas.append(meta)
+                    
+                    chunk_count += 1
+            
+            # Create url_to_full_document mapping
+            url_to_full_document = {}
+            for doc in crawl_results:
+                url_to_full_document[doc['url']] = doc['markdown']
+            
+            # Add to Supabase in smaller batches
+            batch_size = 10  # Smaller batch size for more reliability
+            
+            try:
+                add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
+                
+                return json.dumps({
+                    "success": True,
+                    "url": url,
+                    "crawl_type": crawl_type,
+                    "pages_crawled": len(crawl_results),
+                    "chunks_stored": chunk_count,
+                    "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else []),
+                    "retry_count": retry_count
+                }, indent=2)
+            except Exception as db_error:
+                print(f"Database error: {str(db_error)}")
+                # If this is a database error, return failure immediately
                 return json.dumps({
                     "success": False,
                     "url": url,
-                    "error": "No URLs found in sitemap"
+                    "error": f"Database error: {str(db_error)}"
                 }, indent=2)
-            crawl_results = await crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
-            crawl_type = "sitemap"
-        else:
-            # For regular URLs, use recursive crawl
-            crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent)
-            crawl_type = "webpage"
-        
-        if not crawl_results:
-            return json.dumps({
-                "success": False,
-                "url": url,
-                "error": "No content found"
-            }, indent=2)
-        
-        # Process results and store in Supabase
-        urls = []
-        chunk_numbers = []
-        contents = []
-        metadatas = []
-        chunk_count = 0
-        
-        for doc in crawl_results:
-            source_url = doc['url']
-            md = doc['markdown']
-            chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
+                
+        except PlaywrightError as e:
+            retry_count += 1
+            last_error = str(e)
             
-            for i, chunk in enumerate(chunks):
-                urls.append(source_url)
-                chunk_numbers.append(i)
-                contents.append(chunk)
-                
-                # Extract metadata
-                meta = extract_section_info(chunk)
-                meta["chunk_index"] = i
-                meta["url"] = source_url
-                meta["source"] = urlparse(source_url).netloc
-                meta["crawl_type"] = crawl_type
-                meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
-                metadatas.append(meta)
-                
-                chunk_count += 1
-        
-        # Create url_to_full_document mapping
-        url_to_full_document = {}
-        for doc in crawl_results:
-            url_to_full_document[doc['url']] = doc['markdown']
-        
-        # Add to Supabase
-        # IMPORTANT: Adjust this batch size for more speed if you want! Just don't overwhelm your system or the embedding API ;)
-        batch_size = 20
-        add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
-        
-        return json.dumps({
-            "success": True,
-            "url": url,
-            "crawl_type": crawl_type,
-            "pages_crawled": len(crawl_results),
-            "chunks_stored": chunk_count,
-            "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else [])
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({
-            "success": False,
-            "url": url,
-            "error": str(e)
-        }, indent=2)
+            if retry_count <= max_retries:
+                print(f"Retry {retry_count}/{max_retries} for URL {url} after Playwright error: {last_error}")
+                await asyncio.sleep(2 * retry_count)  # Exponential backoff
+                continue
+            else:
+                return json.dumps({
+                    "success": False,
+                    "url": url,
+                    "error": f"Playwright error after {max_retries} retries: {last_error}"
+                }, indent=2)
+        except Exception as e:
+            retry_count += 1
+            last_error = str(e)
+            
+            if retry_count <= max_retries:
+                print(f"Retry {retry_count}/{max_retries} for URL {url} after error: {last_error}")
+                await asyncio.sleep(2 * retry_count)  # Exponential backoff
+                continue
+            else:
+                return json.dumps({
+                    "success": False,
+                    "url": url,
+                    "error": f"Error after {max_retries} retries: {last_error}"
+                }, indent=2)
+    
+    # This should not be reached, but just in case
+    return json.dumps({
+        "success": False,
+        "url": url,
+        "error": f"Unknown error after {max_retries} retries"
+    }, indent=2)
 
+@retry_async(max_retries=3, initial_delay=2, exception_types=(PlaywrightError, asyncio.TimeoutError))
 async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[str, Any]]:
     """
-    Crawl a .txt or markdown file.
+    Crawl a .txt or markdown file with retry logic.
     
     Args:
         crawler: AsyncWebCrawler instance
@@ -389,38 +673,61 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[s
     Returns:
         List of dictionaries with URL and markdown content
     """
-    crawl_config = CrawlerRunConfig()
+    # Use a more robust configuration with explicit timeouts
+    crawl_config = CrawlerRunConfig(
+        page_timeout=45000,  # 45 seconds timeout
+        navigation_timeout=45000
+    )
 
-    result = await crawler.arun(url=url, config=crawl_config)
-    if result.success and result.markdown:
-        return [{'url': url, 'markdown': result.markdown}]
-    else:
-        print(f"Failed to crawl {url}: {result.error_message}")
-        return []
+    try:
+        result = await crawler.arun(url=url, config=crawl_config)
+        if result.success and result.markdown:
+            return [{'url': url, 'markdown': result.markdown}]
+        else:
+            print(f"Failed to crawl {url}: {result.error_message}")
+            return []
+    except Exception as e:
+        print(f"Exception during markdown file crawl for {url}: {str(e)}")
+        raise  # Re-raise to trigger retry if needed
 
-async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10) -> List[Dict[str, Any]]:
+async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 5) -> List[Dict[str, Any]]:
     """
     Batch crawl multiple URLs in parallel.
     
     Args:
         crawler: AsyncWebCrawler instance
         urls: List of URLs to crawl
-        max_concurrent: Maximum number of concurrent browser sessions
+        max_concurrent: Maximum number of concurrent browser sessions (default reduced to 5)
         
     Returns:
         List of dictionaries with URL and markdown content
     """
-    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
+    # Use more conservative settings for the crawler config
+    crawl_config = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS, 
+        stream=False,
+        page_timeout=45000,  # 45 seconds timeout for page operations
+        navigation_timeout=45000  # 45 seconds timeout for navigation
+    )
+    
+    # Use more conservative memory management settings
     dispatcher = MemoryAdaptiveDispatcher(
-        memory_threshold_percent=70.0,
-        check_interval=1.0,
+        memory_threshold_percent=60.0,  # Lower threshold for memory usage
+        check_interval=0.5,  # Check more frequently
         max_session_permit=max_concurrent
     )
 
-    results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
-    return [{'url': r.url, 'markdown': r.markdown} for r in results if r.success and r.markdown]
+    try:
+        results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
+        return [{'url': r.url, 'markdown': r.markdown} for r in results if r.success and r.markdown]
+    except Exception as e:
+        print(f"Error during batch crawl: {str(e)}")
+        # Return partial results if available
+        if isinstance(results, list) and results:
+            return [{'url': r.url, 'markdown': r.markdown} for r in results if r.success and r.markdown]
+        return []
 
-async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10) -> List[Dict[str, Any]]:
+async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 5) -> List[Dict[str, Any]]:
     """
     Recursively crawl internal links from start URLs up to a maximum depth.
     
@@ -428,19 +735,28 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
         crawler: AsyncWebCrawler instance
         start_urls: List of starting URLs
         max_depth: Maximum recursion depth
-        max_concurrent: Maximum number of concurrent browser sessions
+        max_concurrent: Maximum number of concurrent browser sessions (default reduced to 5)
         
     Returns:
         List of dictionaries with URL and markdown content
     """
-    run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
+    # Use more conservative settings for the crawler config
+    run_config = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS, 
+        stream=False,
+        page_timeout=45000,  # 45 seconds timeout for page operations
+        navigation_timeout=45000  # 45 seconds timeout for navigation
+    )
+    
+    # Use more conservative memory management settings
     dispatcher = MemoryAdaptiveDispatcher(
-        memory_threshold_percent=70.0,
-        check_interval=1.0,
+        memory_threshold_percent=60.0,  # Lower threshold for memory usage
+        check_interval=0.5,  # Check more frequently
         max_session_permit=max_concurrent
     )
 
     visited = set()
+    error_urls = set()  # Track URLs that failed to prevent retrying problematic URLs
 
     def normalize_url(url):
         return urldefrag(url)[0]
@@ -449,25 +765,51 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     results_all = []
 
     for depth in range(max_depth):
-        urls_to_crawl = [normalize_url(url) for url in current_urls if normalize_url(url) not in visited]
+        # Filter out URLs that have already been visited or caused errors
+        urls_to_crawl = [normalize_url(url) for url in current_urls 
+                         if normalize_url(url) not in visited and normalize_url(url) not in error_urls]
+        
         if not urls_to_crawl:
             break
 
-        results = await crawler.arun_many(urls=urls_to_crawl, config=run_config, dispatcher=dispatcher)
-        next_level_urls = set()
+        try:
+            # Break URLs into smaller batches to reduce resource contention
+            batch_size = min(len(urls_to_crawl), 10)  # Process at most 10 URLs at a time
+            for i in range(0, len(urls_to_crawl), batch_size):
+                batch_urls = urls_to_crawl[i:i+batch_size]
+                
+                # Process this batch
+                results = await crawler.arun_many(urls=batch_urls, config=run_config, dispatcher=dispatcher)
+                next_level_urls = set()
 
-        for result in results:
-            norm_url = normalize_url(result.url)
-            visited.add(norm_url)
+                for result in results:
+                    norm_url = normalize_url(result.url)
+                    visited.add(norm_url)
 
-            if result.success and result.markdown:
-                results_all.append({'url': result.url, 'markdown': result.markdown})
-                for link in result.links.get("internal", []):
-                    next_url = normalize_url(link["href"])
-                    if next_url not in visited:
-                        next_level_urls.add(next_url)
+                    if result.success and result.markdown:
+                        results_all.append({'url': result.url, 'markdown': result.markdown})
+                        # Process internal links only if the page was successfully crawled
+                        for link in result.links.get("internal", []):
+                            try:
+                                next_url = normalize_url(link["href"])
+                                if next_url not in visited and next_url not in error_urls:
+                                    next_level_urls.add(next_url)
+                            except Exception as e:
+                                print(f"Error processing link {link}: {str(e)}")
+                    else:
+                        # Mark failed URLs to avoid retry
+                        error_urls.add(norm_url)
+                        print(f"Failed to crawl {result.url}: {result.error_message}")
 
-        current_urls = next_level_urls
+                current_urls = next_level_urls
+                
+                # Add a small delay between batches to allow resources to be freed
+                if i + batch_size < len(urls_to_crawl):
+                    await asyncio.sleep(1)
+                    
+        except Exception as e:
+            print(f"Error during recursive crawl at depth {depth}: {str(e)}")
+            # Continue with the next depth level despite errors
 
     return results_all
 
@@ -581,14 +923,57 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
             "error": str(e)
         }, indent=2)
 
+class SafeSSETransport:
+    """
+    A wrapper around the SSE transport to handle BrokenResourceError more gracefully.
+    This helps prevent the ASGI application from crashing when browser sessions are closed.
+    """
+    def __init__(self, mcp_server: FastMCP):
+        self.mcp_server = mcp_server
+    
+    async def run(self):
+        """
+        Run the MCP server with enhanced error handling for SSE transport.
+        Catches BrokenResourceError and provides more graceful shutdown.
+        """
+        import traceback
+        from anyio import BrokenResourceError
+        
+        try:
+            await self.mcp_server.run_sse_async()
+        except BrokenResourceError as e:
+            print(f"Caught BrokenResourceError in SSE transport: {str(e)}")
+            print("This is likely due to a browser session being closed unexpectedly.")
+            print("The server will continue running.")
+            # Restart the transport after a short delay
+            await asyncio.sleep(2)
+            await self.run()  # Recursive call to restart
+        except Exception as e:
+            print(f"Unhandled exception in SSE transport: {str(e)}")
+            traceback.print_exc()
+            # For other exceptions, we'll still try to restart after a longer delay
+            await asyncio.sleep(5)
+            await self.run()  # Recursive call to restart
+
 async def main():
     transport = os.getenv("TRANSPORT", "sse")
     if transport == 'sse':
-        # Run the MCP server with sse transport
-        await mcp.run_sse_async()
+        # Run the MCP server with the safer SSE transport wrapper
+        try:
+            safe_transport = SafeSSETransport(mcp)
+            await safe_transport.run()
+        except Exception as e:
+            print(f"Critical error in main SSE transport: {str(e)}")
+            import traceback
+            traceback.print_exc()
     else:
         # Run the MCP server with stdio transport
         await mcp.run_stdio_async()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"Fatal error starting server: {str(e)}")
+        import traceback
+        traceback.print_exc()
