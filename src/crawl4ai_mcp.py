@@ -63,12 +63,27 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     supabase_client = None
     
     try:
-        # Initialize the crawler
-        crawler = AsyncWebCrawler(config=browser_config)
-        await crawler.__aenter__()
-        
-        # Initialize Supabase client
-        supabase_client = get_supabase_client()
+        # Initialize Supabase client first since it's less likely to fail
+        print("Initializing Supabase client...")
+        try:
+            supabase_client = get_supabase_client()
+            print("Supabase client initialized successfully")
+        except Exception as db_error:
+            print(f"Error initializing Supabase client: {str(db_error)}")
+            # Continue without raising to allow server to start even without DB
+            supabase_client = None
+            
+        # Try to initialize the crawler, but make it optional
+        print("Initializing crawler...")
+        try:
+            # Initialize the crawler
+            crawler = AsyncWebCrawler(config=browser_config)
+            await crawler.__aenter__()
+            print("Crawler initialized successfully")
+        except Exception as crawler_error:
+            print(f"Error initializing crawler: {str(crawler_error)}")
+            # Set crawler to None, MCP will still work but without crawler functionality
+            crawler = None
         
         # Create context with current time as last health check
         context = Crawl4AIContext(
@@ -77,24 +92,32 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
             last_health_check=time.time()
         )
         
-        # Start background health check task
-        asyncio.create_task(browser_health_check_loop(context))
+        # Only start health check if crawler was initialized
+        if crawler:
+            try:
+                # Start background health check task
+                asyncio.create_task(browser_health_check_loop(context))
+                print("Browser health check started")
+            except Exception as task_error:
+                print(f"Failed to start health check: {str(task_error)}")
+                # Continue without health check
         
-        # Return the context
+        # Return the context - even with partial initialization, server will start
+        print("MCP server context initialized, starting server...")
         yield context
     except Exception as e:
-        print(f"Error during crawler initialization: {str(e)}")
+        print(f"Critical error during initialization: {str(e)}")
         if crawler:
             try:
                 await crawler.__aexit__(None, None, None)
             except Exception as cleanup_error:
                 print(f"Error during crawler cleanup: {str(cleanup_error)}")
-        raise
     finally:
         # Clean up the crawler
         if crawler:
             try:
                 await crawler.__aexit__(None, None, None)
+                print("Crawler cleaned up successfully")
             except Exception as e:
                 print(f"Error during crawler cleanup: {str(e)}")
 
@@ -346,6 +369,26 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
     Returns:
         Summary of the crawling operation and storage in Supabase
     """
+    # Get components from context
+    crawler = ctx.request_context.lifespan_context.crawler
+    supabase_client = ctx.request_context.lifespan_context.supabase_client
+    
+    # Check if crawler is available
+    if not crawler:
+        return json.dumps({
+            "success": False,
+            "url": url,
+            "error": "Crawler is not available. The server started without a crawler due to initialization issues."
+        }, indent=2)
+    
+    # Check if supabase client is available
+    if not supabase_client:
+        return json.dumps({
+            "success": False,
+            "url": url,
+            "error": "Supabase client is not available. The server started without database connection due to initialization issues."
+        }, indent=2)
+    
     # Track retry attempts
     max_retries = 3
     retry_count = 0
@@ -353,11 +396,7 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
     
     while retry_count <= max_retries:
         try:
-            # Get the crawler from the context
-            crawler = ctx.request_context.lifespan_context.crawler
-            supabase_client = ctx.request_context.lifespan_context.supabase_client
-            
-            # Configure the crawl with explicit timeouts
+            # Configure the crawl
             run_config = CrawlerRunConfig(
                 cache_mode=CacheMode.BYPASS, 
                 stream=False
@@ -493,6 +532,26 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
     Returns:
         JSON string with crawl summary and storage information
     """
+    # Get components from context
+    crawler = ctx.request_context.lifespan_context.crawler
+    supabase_client = ctx.request_context.lifespan_context.supabase_client
+    
+    # Check if crawler is available
+    if not crawler:
+        return json.dumps({
+            "success": False,
+            "url": url,
+            "error": "Crawler is not available. The server started without a crawler due to initialization issues."
+        }, indent=2)
+    
+    # Check if supabase client is available
+    if not supabase_client:
+        return json.dumps({
+            "success": False,
+            "url": url,
+            "error": "Supabase client is not available. The server started without database connection due to initialization issues."
+        }, indent=2)
+    
     # Track retry attempts
     max_retries = 2  # For the overall operation
     retry_count = 0
@@ -500,10 +559,6 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
     
     while retry_count <= max_retries:
         try:
-            # Get the crawler and Supabase client from the context
-            crawler = ctx.request_context.lifespan_context.crawler
-            supabase_client = ctx.request_context.lifespan_context.supabase_client
-            
             crawl_results = []
             crawl_type = "webpage"
             
@@ -814,10 +869,17 @@ async def get_available_sources(ctx: Context) -> str:
     Returns:
         JSON string with the list of available sources
     """
+    # Get the Supabase client from the context
+    supabase_client = ctx.request_context.lifespan_context.supabase_client
+    
+    # Check if supabase client is available
+    if not supabase_client:
+        return json.dumps({
+            "success": False,
+            "error": "Supabase client is not available. The server started without database connection due to initialization issues."
+        }, indent=2)
+    
     try:
-        # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
-        
         # Use a direct query with the Supabase client
         # This could be more efficient with a direct Postgres query but
         # I don't want to require users to set a DB_URL environment variable as well
@@ -869,10 +931,18 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
     Returns:
         JSON string with the search results
     """
+    # Get the Supabase client from the context
+    supabase_client = ctx.request_context.lifespan_context.supabase_client
+    
+    # Check if supabase client is available
+    if not supabase_client:
+        return json.dumps({
+            "success": False,
+            "query": query,
+            "error": "Supabase client is not available. The server started without database connection due to initialization issues."
+        }, indent=2)
+    
     try:
-        # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
-        
         # Prepare filter if source is provided and not empty
         filter_metadata = None
         if source and source.strip():
@@ -917,6 +987,9 @@ class SafeSSETransport:
     """
     def __init__(self, mcp_server: FastMCP):
         self.mcp_server = mcp_server
+        self.max_consecutive_failures = 10
+        self.restart_delay = 2
+        self.consecutive_failures = 0
     
     async def run(self):
         """
@@ -927,40 +1000,85 @@ class SafeSSETransport:
         from anyio import BrokenResourceError
         
         try:
+            # Reset failure counter on successful start
+            self.consecutive_failures = 0
             await self.mcp_server.run_sse_async()
-        except BrokenResourceError as e:
-            print(f"Caught BrokenResourceError in SSE transport: {str(e)}")
-            print("This is likely due to a browser session being closed unexpectedly.")
-            print("The server will continue running.")
-            # Restart the transport after a short delay
-            await asyncio.sleep(2)
-            await self.run()  # Recursive call to restart
+        except (BrokenResourceError, RuntimeError) as e:
+            # Include RuntimeError which is happening during initialization
+            self.consecutive_failures += 1
+            print(f"Caught error in SSE transport ({self.consecutive_failures}/{self.max_consecutive_failures}): {str(e)}")
+            
+            if "Received request before initialization was complete" in str(e):
+                print("This is likely due to initialization issues. Retrying after a delay.")
+            elif isinstance(e, BrokenResourceError):
+                print("This is likely due to a browser session being closed unexpectedly.")
+                
+            print(f"The server will wait {self.restart_delay} seconds and then continue running.")
+            
+            # Retry with exponential backoff if we haven't exceeded max failures
+            if self.consecutive_failures < self.max_consecutive_failures:
+                await asyncio.sleep(self.restart_delay)
+                self.restart_delay = min(self.restart_delay * 1.5, 30)  # Increase delay up to 30 seconds max
+                await self.run()  # Recursive call to restart
+            else:
+                print(f"Exceeded maximum consecutive failures ({self.max_consecutive_failures}). Server will not auto-restart.")
+                print("Please check your configuration and restart the server manually.")
+        except asyncio.CancelledError:
+            # Gracefully handle cancellation
+            print("Server shutdown requested.")
+            raise
         except Exception as e:
-            print(f"Unhandled exception in SSE transport: {str(e)}")
+            self.consecutive_failures += 1
+            print(f"Unhandled exception in SSE transport ({self.consecutive_failures}/{self.max_consecutive_failures}): {str(e)}")
             traceback.print_exc()
-            # For other exceptions, we'll still try to restart after a longer delay
-            await asyncio.sleep(5)
-            await self.run()  # Recursive call to restart
+            
+            # Retry with exponential backoff if we haven't exceeded max failures
+            if self.consecutive_failures < self.max_consecutive_failures:
+                print(f"The server will wait {self.restart_delay} seconds and then continue running.")
+                await asyncio.sleep(self.restart_delay)
+                self.restart_delay = min(self.restart_delay * 2, 60)  # Increase delay up to 60 seconds max
+                await self.run()  # Recursive call to restart
+            else:
+                print(f"Exceeded maximum consecutive failures ({self.max_consecutive_failures}). Server will not auto-restart.")
+                print("Please check logs for errors and restart the server manually.")
 
 async def main():
     transport = os.getenv("TRANSPORT", "sse")
+    print(f"Starting MCP server with {transport} transport...")
+    
     if transport == 'sse':
         # Run the MCP server with the safer SSE transport wrapper
         try:
             safe_transport = SafeSSETransport(mcp)
+            print("SSE transport initialized, starting server...")
             await safe_transport.run()
         except Exception as e:
             print(f"Critical error in main SSE transport: {str(e)}")
             import traceback
             traceback.print_exc()
+            # Sleep briefly to allow logs to be written before exiting
+            await asyncio.sleep(2)
     else:
         # Run the MCP server with stdio transport
-        await mcp.run_stdio_async()
+        try:
+            print("Starting stdio transport...")
+            await mcp.run_stdio_async()
+        except Exception as e:
+            print(f"Critical error in stdio transport: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Sleep briefly to allow logs to be written before exiting
+            await asyncio.sleep(2)
 
 if __name__ == "__main__":
+    print(f"Starting Crawl4AI RAG MCP Server on port {os.getenv('PORT', '8051')}...")
     try:
         asyncio.run(main())
     except Exception as e:
         print(f"Fatal error starting server: {str(e)}")
         import traceback
         traceback.print_exc()
+    finally:
+        print("Server shutdown complete.")
+        # Force exit to avoid hanging threads
+        os._exit(0)
