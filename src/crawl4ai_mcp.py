@@ -134,7 +134,7 @@ def is_txt(url: str) -> bool:
     return url.endswith('.txt')
 
 
-async def retry_async(max_retries=3, initial_delay=1, backoff_factor=2, exception_types=(Exception,)):
+def retry_async(max_retries=3, initial_delay=1, backoff_factor=2, exception_types=(Exception,)):
     """
     A decorator for retrying asynchronous functions with exponential backoff.
     
